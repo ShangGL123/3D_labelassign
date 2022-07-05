@@ -219,7 +219,7 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
             torch.tensor(num_total_pos, dtype=torch.float,
                          device=device)).item()
         num_total_samples = max(num_total_samples, 1.0)
-        
+        print(num_total_samples)
         # Transpose heatmaps  从按图片区分变为按task分
 
         return sum(loss_cls_list) / num_total_samples, sum(loss_bbox_list) / num_total_samples
@@ -269,7 +269,7 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
 
     def iou_bbox_cost(self, bboxes1,
                              bboxes2,
-                             mode='iou',
+                             mode='giou',
                              is_aligned=False,
                              coordinate='lidar'):
     
@@ -287,14 +287,14 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
         # box conversion and iou calculation in torch version on CUDA
         # is 10x faster than that in numpy version
 
-        bboxes1_bev = bboxes1.bev
-        bboxes2_bev = bboxes2.bev
-        ret = boxes_iou_bev(bboxes1_bev, bboxes2_bev)
+        # bboxes1_bev = bboxes1.bev
+        # bboxes2_bev = bboxes2.bev
+        # ret = boxes_iou_bev(bboxes1_bev, bboxes2_bev)   # 带旋转角度的iou
 
-        # bboxes1_bev = bboxes1.nearest_bev
-        # bboxes2_bev = bboxes2.nearest_bev
-        # ret = bbox_overlaps(
-        #     bboxes1_bev, bboxes2_bev, mode=mode, is_aligned=is_aligned)
+        bboxes1_bev = bboxes1.nearest_bev
+        bboxes2_bev = bboxes2.nearest_bev
+        ret = bbox_overlaps(
+            bboxes1_bev, bboxes2_bev, mode=mode, is_aligned=is_aligned)
         
         
         # ret = bboxes1.overlaps(bboxes1, bboxes2, mode=mode)
@@ -322,7 +322,7 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
         # ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']
         # print([ i.shape for i in preds_dicts_a_batch['heatmap']])
         
-        selectable_k = 3  # 注意这里的k
+        selectable_k = 9  # 注意这里的k
         device = gt_labels_3d.device
         gt_bboxes_3d = torch.cat(
             (gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]),         # 中心点
@@ -367,12 +367,11 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
             bbox_costs = [ preds_dicts_a_batch['reg'][idx], preds_dicts_a_batch['height'][idx], preds_dicts_a_batch['dim'][idx],\
                               preds_dicts_a_batch['rot'][idx], preds_dicts_a_batch['vel'][idx] ]
         cls_pred = torch.cat(cls_costs, dim=0).permute(1,2,0).reshape(-1,10)   # 10为类别数
-        cls_costs = cls_pred.detach()  
+        cls_costs = cls_pred.clone().detach()  
         reg_pred = torch.cat(bbox_costs, dim=0).permute(1,2,0)    # 10为
         bbox_costs = reg_pred.clone().detach() 
 
-        
-
+    
         # 编码
         H = feature_map_size[0]
         W = feature_map_size[1]
@@ -512,6 +511,7 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
         gt_bboxes = LiDARInstance3DBoxes(anno_boxes_3d, box_dim=anno_boxes_3d.shape[-1], origin=(0.5, 0.5, 0.5)).enlarge_bev()
         # print('中心点坐标', bboxes_cx[candidate_idxs[0]], bboxes_cy[candidate_idxs[0]])
         # print(gt_bboxes[0])
+        # print(cls_costs[candidate_idxs[0]][0], bbox_costs[candidate_idxs[0]][0])
 
 
         # calculate the left, top, right, bottom distance between positive
@@ -522,15 +522,15 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
         b_ = gt_bboxes[:, 3] - ep_bboxes_cy[candidate_idxs].reshape(-1, num_objs)
         is_in_gts = torch.stack([l_, t_, r_, b_], dim=1).min(dim=1)[0] > 0.001
         # print(is_in_gts.shape)
-        # print(torch.nonzero(is_in_gts, as_tuple=False).squeeze())
+        # print(torch.nonzero(is_in_gts, as_tuple=False).squeeze().shape[0]/(is_in_gts.shape[0]*is_in_gts.shape[1]))
         # print('================')
 
 
         INF = 9999
         overlaps_inf = torch.full_like(overlaps,
                                        -INF).t().contiguous().view(-1)
-        # index = candidate_idxs.view(-1)[is_in_gts.view(-1)]
-        index = candidate_idxs.view(-1)
+        index = candidate_idxs.view(-1)[is_in_gts.view(-1)]
+        # index = candidate_idxs.view(-1)
         overlaps_inf[index] = overlaps.t().contiguous().view(-1)[index]
         overlaps_inf = overlaps_inf.view(num_objs, -1).t()
         max_overlaps, argmax_overlaps = overlaps_inf.max(dim=1)
@@ -546,6 +546,8 @@ class CenterHead_cost_assign_1task_3detr(BaseModule):
             assigned_labels[pos_inds] = task_classes[0][             # task_classes[0]  gt_labels_3d
                 assigned_gt_inds[pos_inds] - 1]
 
+        else:
+            num_pos = 0
         labels = gt_labels_3d.new_full((num_bboxes, ),
                                   10,
                                   dtype=torch.long)

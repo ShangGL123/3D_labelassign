@@ -1,7 +1,8 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 import copy
-
+import numpy as np
 import torch
+import torch.nn.functional as F
 from mmcv.cnn import ConvModule, build_conv_layer
 from mmcv.runner import BaseModule, force_fp32
 from torch import nn
@@ -11,237 +12,18 @@ from mmdet3d.core import (circle_nms, draw_heatmap_gaussian, gaussian_radius,
 from mmdet3d.models import builder
 from mmdet3d.models.builder import HEADS, build_loss
 from mmdet3d.models.utils import clip_sigmoid
-from mmdet3d.ops.iou3d.iou3d_utils import nms_gpu
-from mmdet.core import build_bbox_coder, multi_apply
+from mmdet3d.ops.iou3d.iou3d_utils import nms_gpu, boxes_iou_bev
+from mmdet.core import build_bbox_coder, multi_apply, reduce_mean
+from mmdet.core.bbox import bbox_overlaps
 
+from mmdet3d.core.bbox.structures.box_3d_mode import (Box3DMode, CameraInstance3DBoxes,
+                              DepthInstance3DBoxes, LiDARInstance3DBoxes)
+from mmdet3d.models.dense_heads import SeparateHead
 
-@HEADS.register_module()
-class SeparateHead(BaseModule):
-    """SeparateHead for CenterHead.
-
-    Args:
-        in_channels (int): Input channels for conv_layer.
-        heads (dict): Conv information.
-        head_conv (int, optional): Output channels.
-            Default: 64.
-        final_kernel (int, optional): Kernel size for the last conv layer.
-            Default: 1.
-        init_bias (float, optional): Initial bias. Default: -2.19.
-        conv_cfg (dict, optional): Config of conv layer.
-            Default: dict(type='Conv2d')
-        norm_cfg (dict, optional): Config of norm layer.
-            Default: dict(type='BN2d').
-        bias (str, optional): Type of bias. Default: 'auto'.
-    """
-
-    def __init__(self,
-                 in_channels,
-                 heads,
-                 head_conv=64,
-                 final_kernel=1,
-                 init_bias=-2.19,
-                 conv_cfg=dict(type='Conv2d'),
-                 norm_cfg=dict(type='BN2d'),
-                 bias='auto',
-                 init_cfg=None,
-                 **kwargs):
-        assert init_cfg is None, 'To prevent abnormal initialization ' \
-            'behavior, init_cfg is not allowed to be set'
-        super(SeparateHead, self).__init__(init_cfg=init_cfg)
-        self.heads = heads
-        self.init_bias = init_bias
-        for head in self.heads:
-            classes, num_conv = self.heads[head]
-
-            conv_layers = []
-            c_in = in_channels
-            for i in range(num_conv - 1):
-                conv_layers.append(
-                    ConvModule(
-                        c_in,
-                        head_conv,
-                        kernel_size=final_kernel,
-                        stride=1,
-                        padding=final_kernel // 2,
-                        bias=bias,
-                        conv_cfg=conv_cfg,
-                        norm_cfg=norm_cfg))
-                c_in = head_conv
-
-            conv_layers.append(
-                build_conv_layer(
-                    conv_cfg,
-                    head_conv,
-                    classes,
-                    kernel_size=final_kernel,
-                    stride=1,
-                    padding=final_kernel // 2,
-                    bias=True))
-            conv_layers = nn.Sequential(*conv_layers)
-
-            self.__setattr__(head, conv_layers)
-
-            if init_cfg is None:
-                self.init_cfg = dict(type='Kaiming', layer='Conv2d')
-
-    def init_weights(self):
-        """Initialize weights."""
-        super().init_weights()
-        for head in self.heads:
-            if head == 'heatmap':
-                self.__getattr__(head)[-1].bias.data.fill_(self.init_bias)
-
-    def forward(self, x):
-        """Forward function for SepHead.
-
-        Args:
-            x (torch.Tensor): Input feature map with the shape of
-                [B, 512, 128, 128].
-
-        Returns:
-            dict[str: torch.Tensor]: contains the following keys:
-
-                -reg （torch.Tensor): 2D regression value with the
-                    shape of [B, 2, H, W].
-                -height (torch.Tensor): Height value with the
-                    shape of [B, 1, H, W].
-                -dim (torch.Tensor): Size value with the shape
-                    of [B, 3, H, W].
-                -rot (torch.Tensor): Rotation value with the
-                    shape of [B, 2, H, W].
-                -vel (torch.Tensor): Velocity value with the
-                    shape of [B, 2, H, W].
-                -heatmap (torch.Tensor): Heatmap with the shape of
-                    [B, N, H, W].
-        """
-        ret_dict = dict()
-        for head in self.heads:
-            ret_dict[head] = self.__getattr__(head)(x)
-
-        return ret_dict
 
 
 @HEADS.register_module()
-class DCNSeparateHead(BaseModule):
-    r"""DCNSeparateHead for CenterHead.
-
-    .. code-block:: none
-            /-----> DCN for heatmap task -----> heatmap task.
-    feature
-            \-----> DCN for regression tasks -----> regression tasks
-
-    Args:
-        in_channels (int): Input channels for conv_layer.
-        num_cls (int): Number of classes.
-        heads (dict): Conv information.
-        dcn_config (dict): Config of dcn layer.
-        head_conv (int, optional): Output channels.
-            Default: 64.
-        final_kernel (int, optional): Kernel size for the last conv
-            layer. Default: 1.
-        init_bias (float, optional): Initial bias. Default: -2.19.
-        conv_cfg (dict, optional): Config of conv layer.
-            Default: dict(type='Conv2d')
-        norm_cfg (dict, optional): Config of norm layer.
-            Default: dict(type='BN2d').
-        bias (str, optional): Type of bias. Default: 'auto'.
-    """  # noqa: W605
-
-    def __init__(self,
-                 in_channels,
-                 num_cls,
-                 heads,
-                 dcn_config,
-                 head_conv=64,
-                 final_kernel=1,
-                 init_bias=-2.19,
-                 conv_cfg=dict(type='Conv2d'),
-                 norm_cfg=dict(type='BN2d'),
-                 bias='auto',
-                 init_cfg=None,
-                 **kwargs):
-        assert init_cfg is None, 'To prevent abnormal initialization ' \
-            'behavior, init_cfg is not allowed to be set'
-        super(DCNSeparateHead, self).__init__(init_cfg=init_cfg)
-        if 'heatmap' in heads:
-            heads.pop('heatmap')
-        # feature adaptation with dcn
-        # use separate features for classification / regression
-        self.feature_adapt_cls = build_conv_layer(dcn_config)
-
-        self.feature_adapt_reg = build_conv_layer(dcn_config)
-
-        # heatmap prediction head
-        cls_head = [
-            ConvModule(
-                in_channels,
-                head_conv,
-                kernel_size=3,
-                padding=1,
-                conv_cfg=conv_cfg,
-                bias=bias,
-                norm_cfg=norm_cfg),
-            build_conv_layer(
-                conv_cfg,
-                head_conv,
-                num_cls,
-                kernel_size=3,
-                stride=1,
-                padding=1,
-                bias=bias)
-        ]
-        self.cls_head = nn.Sequential(*cls_head)
-        self.init_bias = init_bias
-        # other regression target
-        self.task_head = SeparateHead(
-            in_channels,
-            heads,
-            head_conv=head_conv,
-            final_kernel=final_kernel,
-            bias=bias)
-        if init_cfg is None:
-            self.init_cfg = dict(type='Kaiming', layer='Conv2d')
-
-    def init_weights(self):
-        """Initialize weights."""
-        super().init_weights()
-        self.cls_head[-1].bias.data.fill_(self.init_bias)
-
-    def forward(self, x):
-        """Forward function for DCNSepHead.
-
-        Args:
-            x (torch.Tensor): Input feature map with the shape of
-                [B, 512, 128, 128].
-
-        Returns:
-            dict[str: torch.Tensor]: contains the following keys:
-
-                -reg （torch.Tensor): 2D regression value with the
-                    shape of [B, 2, H, W].
-                -height (torch.Tensor): Height value with the
-                    shape of [B, 1, H, W].
-                -dim (torch.Tensor): Size value with the shape
-                    of [B, 3, H, W].
-                -rot (torch.Tensor): Rotation value with the
-                    shape of [B, 2, H, W].
-                -vel (torch.Tensor): Velocity value with the
-                    shape of [B, 2, H, W].
-                -heatmap (torch.Tensor): Heatmap with the shape of
-                    [B, N, H, W].
-        """
-        center_feat = self.feature_adapt_cls(x)
-        reg_feat = self.feature_adapt_reg(x)
-
-        cls_score = self.cls_head(center_feat)
-        ret = self.task_head(reg_feat)
-        ret['heatmap'] = cls_score
-
-        return ret
-
-
-@HEADS.register_module()
-class CenterHead(BaseModule):
+class CenterHead_cost_assign_1task_test(BaseModule):
     """CenterHead for CenterPoint.
 
     Args:
@@ -292,7 +74,7 @@ class CenterHead(BaseModule):
                  init_cfg=None):
         assert init_cfg is None, 'To prevent abnormal initialization ' \
             'behavior, init_cfg is not allowed to be set'
-        super(CenterHead, self).__init__(init_cfg=init_cfg)
+        super(CenterHead_cost_assign_1task_test, self).__init__(init_cfg=init_cfg)
 
         num_classes = [len(t['class_names']) for t in tasks]
         self.class_names = [t['class_names'] for t in tasks]
@@ -384,7 +166,7 @@ class CenterHead(BaseModule):
             feat = feat.view(-1, dim)
         return feat
 
-    def get_targets(self, gt_bboxes_3d, gt_labels_3d):
+    def get_targets(self, gt_bboxes_3d, gt_labels_3d, preds_dicts):
         """Generate targets.
 
         How each output is transformed:
@@ -415,23 +197,111 @@ class CenterHead(BaseModule):
                     - list[torch.Tensor]: Masks indicating which
                         boxes are valid.
         """
-        heatmaps, anno_boxes, inds, masks = multi_apply(
-            self.get_targets_single, gt_bboxes_3d, gt_labels_3d)
-        # Transpose heatmaps  从按图片区分变为按task分
-        heatmaps = list(map(list, zip(*heatmaps)))
-        heatmaps = [torch.stack(hms_) for hms_ in heatmaps]
-        # Transpose anno_boxes
-        anno_boxes = list(map(list, zip(*anno_boxes)))
-        anno_boxes = [torch.stack(anno_boxes_) for anno_boxes_ in anno_boxes]
-        # Transpose inds
-        inds = list(map(list, zip(*inds)))
-        inds = [torch.stack(inds_) for inds_ in inds]
-        # Transpose inds
-        masks = list(map(list, zip(*masks)))
-        masks = [torch.stack(masks_) for masks_ in masks]
-        return heatmaps, anno_boxes, inds, masks
 
-    def get_targets_single(self, gt_bboxes_3d, gt_labels_3d):
+        batch_size = preds_dicts[0][0]['heatmap'].shape[0]
+        preds_dicts_batch = []
+        for i in range(batch_size):
+            dict1 = {}
+            for key in preds_dicts[0][0]:
+                value = []
+                for j in range(len(preds_dicts)):
+                    value.append(preds_dicts[j][0][key][i])
+                dict1[key] = value
+            preds_dicts_batch.append(dict1)
+            i += 1
+
+        loss_cls_list, loss_bbox_list, pos_inds_list = multi_apply(
+            self.get_targets_single, gt_bboxes_3d, gt_labels_3d, preds_dicts_batch)
+
+        device = preds_dicts[0][0]['heatmap'].device
+        num_total_pos = sum([max(inds, 1) for inds in pos_inds_list])
+        num_total_samples = reduce_mean(
+            torch.tensor(num_total_pos, dtype=torch.float,
+                         device=device)).item()
+        num_total_samples = max(num_total_samples, 1.0)
+        
+        # Transpose heatmaps  从按图片区分变为按task分
+
+        return sum(loss_cls_list) / num_total_samples, sum(loss_bbox_list) / num_total_samples
+
+    def cls_cost(self, cls_pred, gt_labels):
+        """
+        Args:
+            cls_pred (Tensor): The prediction with shape (num_query, 1, *) or
+                (num_query, *).
+            gt_labels (Tensor): The learning label of prediction with
+                shape (num_gt, *).
+
+        Returns:
+            Tensor: Cross entropy cost matrix in shape (num_query, num_gt).
+        """
+        cls_pred = cls_pred.flatten(1).float()
+        gt_labels = gt_labels.flatten(1).float()
+        n = cls_pred.shape[1]
+        pos = F.binary_cross_entropy_with_logits(
+            cls_pred, torch.ones_like(cls_pred), reduction='none')
+        neg = F.binary_cross_entropy_with_logits(
+            cls_pred, torch.zeros_like(cls_pred), reduction='none')
+        cls_cost = torch.einsum('nc,mc->nm', pos, gt_labels) + \
+            torch.einsum('nc,mc->nm', neg, 1 - gt_labels)
+        cls_cost = cls_cost / n
+
+        return cls_cost
+
+
+    def focal_cls_cost(self, cls_pred, gt_labels):
+        weight=2
+        alpha=0.25
+        gamma=2
+        eps=1e-12
+        cls_pred = cls_pred.sigmoid()
+        neg_cost = -(1 - cls_pred + eps).log() * (1 - alpha) * cls_pred.pow(gamma)
+        pos_cost = -(cls_pred + eps).log() * alpha * (1 - cls_pred).pow(gamma)
+
+        cls_cost = pos_cost[:, gt_labels] - neg_cost[:, gt_labels]
+        return cls_cost * weight
+
+
+    def bbox_cost(self, bbox_pred, gt_bboxes):
+        weight=0.25
+        bbox_cost = torch.cdist(bbox_pred, gt_bboxes, p=1)
+        return bbox_cost * weight
+
+    def iou_bbox_cost(self, bboxes1,
+                             bboxes2,
+                             mode='iou',
+                             is_aligned=False,
+                             coordinate='lidar'):
+    
+        assert bboxes1.size(-1) == bboxes2.size(-1) >= 7
+        # 只计算bev的iou
+        # bboxes1[:,3] = bboxes1[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
+        # bboxes1[:,4] = bboxes1[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
+        # bboxes2[:,3] = bboxes2[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
+        # bboxes2[:,4] = bboxes2[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
+
+        bboxes1 = LiDARInstance3DBoxes(bboxes1, box_dim=bboxes1.shape[-1], origin=(0.5, 0.5, 0.5))
+        bboxes2 = LiDARInstance3DBoxes(bboxes2, box_dim=bboxes2.shape[-1], origin=(0.5, 0.5, 0.5))
+
+        # Change the bboxes to bev
+        # box conversion and iou calculation in torch version on CUDA
+        # is 10x faster than that in numpy version
+
+        bboxes1_bev = bboxes1.bev
+        bboxes2_bev = bboxes2.bev
+        ret = boxes_iou_bev(bboxes1_bev, bboxes2_bev)
+
+        # bboxes1_bev = bboxes1.nearest_bev
+        # bboxes2_bev = bboxes2.nearest_bev
+        # ret = bbox_overlaps(
+        #     bboxes1_bev, bboxes2_bev, mode=mode, is_aligned=is_aligned)
+        
+        
+        # ret = bboxes1.overlaps(bboxes1, bboxes2, mode=mode)
+        return -ret
+
+
+    def get_targets_single(self, gt_bboxes_3d, gt_labels_3d, preds_dicts_a_batch):
         """Generate training targets for a single sample.
 
         Args:
@@ -449,10 +319,21 @@ class CenterHead(BaseModule):
                 - list[torch.Tensor]: Masks indicating which boxes
                     are valid.
         """
+        # ['reg', 'height', 'dim', 'rot', 'vel', 'heatmap']
+        # print([ i.shape for i in preds_dicts_a_batch['heatmap']])
+        
+        selectable_k = self.train_cfg['selectable_k']  # 注意这里的k
+        clss_weight = self.train_cfg['clss_weight']
+        regg_weight = self.train_cfg['regg_weight']
+
+
         device = gt_labels_3d.device
         gt_bboxes_3d = torch.cat(
-            (gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]),
+            (gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]),         # 中心点
             dim=1).to(device)
+        
+        # gt_bboxes_3d_decode = gt_bboxes_3d.tensor.to(device)         # 底部中心点
+
         max_objs = self.train_cfg['max_objs'] * self.train_cfg['dense_reg']
         grid_size = torch.tensor(self.train_cfg['grid_size'])
         pc_range = torch.tensor(self.train_cfg['point_cloud_range'])
@@ -479,28 +360,66 @@ class CenterHead(BaseModule):
             for m in mask:
                 task_box.append(gt_bboxes_3d[m])
                 # 0 is background for each task, so we need to add 1 here.
-                task_class.append(gt_labels_3d[m] + 1 - flag2)
+                task_class.append(gt_labels_3d[m] - flag2)
             task_boxes.append(torch.cat(task_box, axis=0).to(device))
             task_classes.append(torch.cat(task_class).long().to(device))
             flag2 += len(mask)
-        draw_gaussian = draw_heatmap_gaussian
-        heatmaps, anno_boxes, inds, masks = [], [], [], []
-
+        
+        cls_costs, bbox_costs = [], [] 
         for idx, task_head in enumerate(self.task_heads):
-            heatmap = gt_bboxes_3d.new_zeros(
-                (len(self.class_names[idx]), feature_map_size[1],
-                 feature_map_size[0]))
+            cls_costs.append(preds_dicts_a_batch['heatmap'][idx])
+            bbox_costs = [ preds_dicts_a_batch['reg'][idx], preds_dicts_a_batch['height'][idx], preds_dicts_a_batch['dim'][idx],\
+                              preds_dicts_a_batch['rot'][idx], preds_dicts_a_batch['vel'][idx] ]
+        cls_pred = torch.cat(cls_costs, dim=0).permute(1,2,0).reshape(-1,10)   # 10为类别数
+        cls_costs = cls_pred.clone().detach()  
+        reg_pred = torch.cat(bbox_costs, dim=0).permute(1,2,0)    # 10为
+        bbox_costs = reg_pred.clone().detach() 
 
-            anno_box = gt_bboxes_3d.new_zeros((max_objs, 10),
-                                              dtype=torch.float32)
+        
+        bbox_costs = torch.zeros_like(bbox_costs)
+        # 编码
+        H = feature_map_size[0]
+        W = feature_map_size[1]
+        num_bboxes = H * W
+        grid_y, grid_x = torch.meshgrid(
+                torch.linspace(
+                    0, H - 1, H, dtype=bbox_costs.dtype, device=device),
+                torch.linspace(
+                    0, W - 1, W, dtype=bbox_costs.dtype, device=device))
+        bbox_costs[:, :, 0] += grid_x
+        bbox_costs[:, :, 1] += grid_y
+        
+        # bbox_costs_decode = bbox_costs.new_zeros((bbox_costs.shape[0], bbox_costs.shape[1], 7))
+        # bbox_costs_decode[:, :, 0:2] = bbox_costs[:, :, 0:2]
+        bbox_costs = bbox_costs.reshape(-1,10)
 
-            ind = gt_labels_3d.new_zeros((max_objs), dtype=torch.int64)
-            mask = gt_bboxes_3d.new_zeros((max_objs), dtype=torch.uint8)
+        #解码到3d lidar格式(xyz仍是降采样后的结果) rot = torch.atan2(rot_sine, rot_cosine)  torch.exp(preds_dict[0]['dim'])
+        # bbox_costs[:, 3:6] = torch.exp(bbox_costs[:, 3:6])
+        # bbox_costs[:, 6] = torch.atan2(bbox_costs[:, 6], bbox_costs[:, 7])
+        # bbox_costs = bbox_costs[:, :7]
+
+        all_points_x, all_points_y = grid_x.reshape(-1), grid_y.reshape(-1)
+
+
+        # cls_costs = self.cls_cost(cls_costs, F.one_hot(gt_labels_3d, 10)) # detr式的cost
+        
+        # 注意task_masks改变了gt的顺序
+        # cls_costs = -torch.log(torch.sigmoid(cls_costs[:, task_classes[0]]))
+        cls_costs = self.focal_cls_cost(cls_costs, task_classes[0])
+    
+        for idx, task_head in enumerate(self.task_heads):
+            # ind = gt_labels_3d.new_zeros((max_objs), dtype=torch.int64)
+            # mask = gt_bboxes_3d.new_zeros((max_objs), dtype=torch.uint8)
 
             num_objs = min(task_boxes[idx].shape[0], max_objs)
+            anno_boxes = gt_bboxes_3d.new_zeros((num_objs, 10),
+                                              dtype=torch.float32)
+
+            anno_boxes_3d = gt_bboxes_3d.new_zeros((num_objs, 7),
+                                              dtype=torch.float32)                    
 
             for k in range(num_objs):
-                cls_id = task_classes[idx][k] - 1
+                cls_id = task_classes[idx][k]
 
                 width = task_boxes[idx][k][3]
                 length = task_boxes[idx][k][4]     # 这里是否写反了？
@@ -512,10 +431,6 @@ class CenterHead(BaseModule):
                     'out_size_factor']
 
                 if width > 0 and length > 0:
-                    radius = gaussian_radius(
-                        (length, width),
-                        min_overlap=self.train_cfg['gaussian_overlap'])
-                    radius = max(self.train_cfg['min_radius'], int(radius))
 
                     # be really careful for the coordinate system of
                     # your box annotation.
@@ -532,32 +447,22 @@ class CenterHead(BaseModule):
                     center = torch.tensor([coor_x, coor_y],
                                           dtype=torch.float32,
                                           device=device)
-                    center_int = center.to(torch.int32)
-
-                    # throw out not in range objects to avoid out of array
-                    # area when creating the heatmap
-                    if not (0 <= center_int[0] < feature_map_size[0]
-                            and 0 <= center_int[1] < feature_map_size[1]):
-                        continue
-
-                    draw_gaussian(heatmap[cls_id], center_int, radius)
-
-                    new_idx = k
-                    x, y = center_int[0], center_int[1]
-
-                    assert (y * feature_map_size[0] + x <
-                            feature_map_size[0] * feature_map_size[1])
-
-                    ind[new_idx] = y * feature_map_size[0] + x
-                    mask[new_idx] = 1
+                   
                     # TODO: support other outdoor dataset
                     vx, vy = task_boxes[idx][k][7:]
                     rot = task_boxes[idx][k][6]
                     box_dim = task_boxes[idx][k][3:6]
+                    
+                    anno_boxes_3d[k] = torch.cat([
+                        center,                              
+                        z.unsqueeze(0), box_dim,
+                        rot.unsqueeze(0)
+                    ])
+
                     if self.norm_bbox:
-                        box_dim = box_dim.log()
-                    anno_box[new_idx] = torch.cat([
-                        center - torch.tensor([x, y], device=device),
+                        box_dim = box_dim.log()        # 这里变化
+                    anno_boxes[k] = torch.cat([
+                        center,                              
                         z.unsqueeze(0), box_dim,
                         torch.sin(rot).unsqueeze(0),
                         torch.cos(rot).unsqueeze(0),
@@ -565,11 +470,115 @@ class CenterHead(BaseModule):
                         vy.unsqueeze(0)
                     ])
 
-            heatmaps.append(heatmap)
-            anno_boxes.append(anno_box)
-            masks.append(mask)
-            inds.append(ind)
-        return heatmaps, anno_boxes, inds, masks
+                    
+        # print(anno_boxes[0:5,0:10])
+        # 坐标恢复到原图尺寸 * self.train_cfg['out_size_factor']
+        # bbox_costs[:,:3] = self.train_cfg['out_size_factor'] * bbox_costs[:,:3]
+        # anno_boxes_clone = anno_boxes.clone()
+        # anno_boxes_clone[:,:3] = self.train_cfg['out_size_factor'] * anno_boxes_clone[:,:3]
+        # bbox_costs = self.bbox_cost(bbox_costs[:,:8], anno_boxes_clone[:,:8])  #不计算速度
+
+        bbox_costs = self.bbox_cost(bbox_costs[:,:2], anno_boxes[:,:2])  #只计算中心点
+        # bbox_costs = self.iou_bbox_cost(bbox_costs, anno_boxes_3d)
+        overlaps = - (clss_weight * cls_costs + regg_weight * bbox_costs)
+
+
+        assigned_gt_inds = overlaps.new_full((num_bboxes, ),
+                                             0,
+                                             dtype=torch.long,
+                                             device=device)
+        _, topk_idxs = overlaps.topk(selectable_k, dim=0)
+        candidate_idxs = topk_idxs
+
+    
+        # 限制pred的点在gt框内
+        # candidate_points = all_points[topk_idxs.t().reshape(-1)]
+        # is_in_gts_matrix = LiDARInstance3DBoxes(anno_boxes_3d, box_dim=anno_boxes_3d.shape[-1], origin=(0.5, 0.5, 0.5)).points_in_boxes_all(candidate_points)
+        # is_in_gts_matrix_spilt = torch.split(is_in_gts_matrix, selectable_k, dim=0)
+        # is_in_gts = []
+        # for i, mat in enumerate(is_in_gts_matrix_spilt):
+        #     is_in_gts.append(mat[:, i])
+        # print(torch.nonzero(torch.stack(is_in_gts, dim=-1)>0))
+        # is_in_gts = torch.stack(is_in_gts, dim=-1) == 1
+
+
+        for gt_idx in range(num_objs):
+            candidate_idxs[:, gt_idx] += gt_idx * num_bboxes
+        
+        # 限制anchor点在BEV框内
+        bboxes_cx, bboxes_cy = all_points_x, all_points_y
+
+        ep_bboxes_cx = bboxes_cx.reshape(1, -1).expand(
+            num_objs, num_bboxes).contiguous().view(-1)
+        ep_bboxes_cy = bboxes_cy.reshape(1, -1).expand(
+            num_objs, num_bboxes).contiguous().view(-1)
+        candidate_idxs = candidate_idxs.reshape(-1)
+
+
+        # 将l w根据voxel_size和stride变换
+        anno_boxes_3d[:,3] = anno_boxes_3d[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
+        anno_boxes_3d[:,4] = anno_boxes_3d[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
+        gt_bboxes = LiDARInstance3DBoxes(anno_boxes_3d, box_dim=anno_boxes_3d.shape[-1], origin=(0.5, 0.5, 0.5)).enlarge_bev()
+        # print(gt_bboxes[:,2]-gt_bboxes[:,0], gt_bboxes[:,3]-gt_bboxes[:,1])
+        # print('中心点坐标', bboxes_cx[candidate_idxs[0]], bboxes_cy[candidate_idxs[0]])
+        # print((gt_bboxes[0][0]+gt_bboxes[0][2])/2, (gt_bboxes[0][1]+gt_bboxes[0][3])/2)
+        # print(cls_costs[candidate_idxs[0]][0], bbox_costs[candidate_idxs[0]][0])
+
+
+        # calculate the left, top, right, bottom distance between positive
+        # bbox center and gt side
+        l_ = ep_bboxes_cx[candidate_idxs].reshape(-1, num_objs) - gt_bboxes[:, 0]
+        t_ = ep_bboxes_cy[candidate_idxs].reshape(-1, num_objs) - gt_bboxes[:, 1]
+        r_ = gt_bboxes[:, 2] - ep_bboxes_cx[candidate_idxs].reshape(-1, num_objs)
+        b_ = gt_bboxes[:, 3] - ep_bboxes_cy[candidate_idxs].reshape(-1, num_objs)
+        is_in_gts = torch.stack([l_, t_, r_, b_], dim=1).min(dim=1)[0] > 0.001
+        # print(is_in_gts.shape)
+        # print(torch.nonzero(is_in_gts, as_tuple=False).squeeze().shape[0]/(is_in_gts.shape[0]*is_in_gts.shape[1]))
+        # print('================')
+
+
+        INF = 9999
+        overlaps_inf = torch.full_like(overlaps,
+                                       -INF).t().contiguous().view(-1)
+        # index = candidate_idxs.view(-1)[is_in_gts.view(-1)]
+        index = candidate_idxs.view(-1)
+        overlaps_inf[index] = overlaps.t().contiguous().view(-1)[index]
+        overlaps_inf = overlaps_inf.view(num_objs, -1).t()
+        max_overlaps, argmax_overlaps = overlaps_inf.max(dim=1)
+        # print(argmax_overlaps.shape, max_overlaps[:20])
+        assigned_gt_inds[max_overlaps != -INF] = argmax_overlaps[max_overlaps != -INF] + 1
+        
+        assigned_labels = assigned_gt_inds.new_full((num_bboxes, ), -1)
+        pos_inds = torch.nonzero(
+                assigned_gt_inds > 0, as_tuple=False).squeeze()
+        if pos_inds.numel() > 0:
+            # print('----------------------')
+            num_pos = pos_inds.numel()
+            assigned_labels[pos_inds] = task_classes[0][             # task_classes[0]  gt_labels_3d
+                assigned_gt_inds[pos_inds] - 1]
+
+        labels = gt_labels_3d.new_full((num_bboxes, ),
+                                  10,
+                                  dtype=torch.long)
+        labels[pos_inds] = assigned_labels[pos_inds]
+        loss_cls = self.loss_cls(cls_pred, labels, avg_factor=1.)     # 这里avg_factor要修改
+        
+        code_weights = self.train_cfg.get('code_weights', None)
+        reg_pred = reg_pred.reshape(-1,10)
+
+        bbox_weights = torch.zeros_like(reg_pred)
+        bbox_targets = torch.zeros_like(reg_pred)
+        bbox_targets[pos_inds, :] = anno_boxes[assigned_gt_inds[pos_inds] - 1, :]
+        bbox_weights[pos_inds, :] = bbox_weights.new_tensor(code_weights)
+        bbox_targets[pos_inds, 0] = bbox_targets[pos_inds, 0] - pos_inds % W
+        bbox_targets[pos_inds, 1] = bbox_targets[pos_inds, 1] - torch.floor(pos_inds / W)
+        # print(bbox_targets[pos_inds[0:6]])
+        # print(reg_pred[pos_inds[0:6]])
+        # print('================================')
+
+        loss_bbox = self.loss_bbox(reg_pred, bbox_targets, bbox_weights, avg_factor = 1.)
+        return loss_cls, loss_bbox, num_pos
+        
 
     @force_fp32(apply_to=('preds_dicts'))
     def loss(self, gt_bboxes_3d, gt_labels_3d, preds_dicts, **kwargs):
@@ -584,43 +593,17 @@ class CenterHead(BaseModule):
         Returns:
             dict[str:torch.Tensor]: Loss of heatmap and bbox of each task.
         """
-        heatmaps, anno_boxes, inds, masks = self.get_targets(
-            gt_bboxes_3d, gt_labels_3d)
+
+        
+        cls_loss, bbox_loss = self.get_targets(
+            gt_bboxes_3d, gt_labels_3d, preds_dicts)
+
         loss_dict = dict()
+
         for task_id, preds_dict in enumerate(preds_dicts):
-            # heatmap focal loss
-            preds_dict[0]['heatmap'] = clip_sigmoid(preds_dict[0]['heatmap'])
-            num_pos = heatmaps[task_id].eq(1).float().sum().item()
-            loss_heatmap = self.loss_cls(
-                preds_dict[0]['heatmap'],
-                heatmaps[task_id],
-                avg_factor=max(num_pos, 1))
-            target_box = anno_boxes[task_id]
-            # reconstruct the anno_box from multiple reg heads
-            preds_dict[0]['anno_box'] = torch.cat(
-                (preds_dict[0]['reg'], preds_dict[0]['height'],
-                 preds_dict[0]['dim'], preds_dict[0]['rot'],
-                 preds_dict[0]['vel']),
-                dim=1)
-
-            # Regression loss for dimension, offset, height, rotation
-            ind = inds[task_id]
-            num = masks[task_id].float().sum()
-            pred = preds_dict[0]['anno_box'].permute(0, 2, 3, 1).contiguous()
-            pred = pred.view(pred.size(0), -1, pred.size(3))
-            pred = self._gather_feat(pred, ind)
-            mask = masks[task_id].unsqueeze(2).expand_as(target_box).float()
-            isnotnan = (~torch.isnan(target_box)).float()
-            # print((1-isnotnan).sum())
-            mask *= isnotnan
-
-            code_weights = self.train_cfg.get('code_weights', None)
-            bbox_weights = mask * mask.new_tensor(code_weights)
-            # print(pred.shape, target_box.shape)
-            loss_bbox = self.loss_bbox(
-                pred, target_box, bbox_weights, avg_factor=(num + 1e-4))
-            loss_dict[f'task{task_id}.loss_heatmap'] = loss_heatmap
-            loss_dict[f'task{task_id}.loss_bbox'] = loss_bbox
+            
+            loss_dict[f'task{task_id}.loss_heatmap'] = cls_loss
+            loss_dict[f'task{task_id}.loss_bbox'] = bbox_loss
         return loss_dict
 
     def get_bboxes(self, preds_dicts, img_metas, img=None, rescale=False):

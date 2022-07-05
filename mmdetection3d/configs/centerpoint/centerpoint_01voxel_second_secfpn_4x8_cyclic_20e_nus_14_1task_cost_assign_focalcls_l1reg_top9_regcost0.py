@@ -48,9 +48,9 @@ model = dict(
     # model training and testing settings
     train_cfg=dict(
         pts=dict(
-            selectable_k=3,
+            selectable_k=9,
             clss_weight = 1,
-            regg_weight = 1,
+            regg_weight = 0,
             grid_size=[1024, 1024, 40],
             voxel_size=voxel_size,
             out_size_factor=8,

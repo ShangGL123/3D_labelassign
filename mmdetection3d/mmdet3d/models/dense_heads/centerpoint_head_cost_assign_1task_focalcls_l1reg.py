@@ -250,8 +250,7 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
 
 
     def focal_cls_cost(self, cls_pred, gt_labels):
-
-        weight=1.
+        weight=2
         alpha=0.25
         gamma=2
         eps=1e-12
@@ -264,8 +263,9 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
 
 
     def bbox_cost(self, bbox_pred, gt_bboxes):
+        weight=0.25
         bbox_cost = torch.cdist(bbox_pred, gt_bboxes, p=1)
-        return bbox_cost
+        return bbox_cost * weight
 
     def iou_bbox_cost(self, bboxes1,
                              bboxes2,
@@ -275,10 +275,10 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
     
         assert bboxes1.size(-1) == bboxes2.size(-1) >= 7
         # 只计算bev的iou
-        bboxes1[:,3] = bboxes1[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
-        bboxes1[:,4] = bboxes1[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
-        bboxes2[:,3] = bboxes2[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
-        bboxes2[:,4] = bboxes2[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
+        # bboxes1[:,3] = bboxes1[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
+        # bboxes1[:,4] = bboxes1[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
+        # bboxes2[:,3] = bboxes2[:,3] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][0]
+        # bboxes2[:,4] = bboxes2[:,4] / self.train_cfg['out_size_factor'] / self.train_cfg['voxel_size'][1]
 
         bboxes1 = LiDARInstance3DBoxes(bboxes1, box_dim=bboxes1.shape[-1], origin=(0.5, 0.5, 0.5))
         bboxes2 = LiDARInstance3DBoxes(bboxes2, box_dim=bboxes2.shape[-1], origin=(0.5, 0.5, 0.5))
@@ -323,6 +323,10 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
         # print([ i.shape for i in preds_dicts_a_batch['heatmap']])
         
         selectable_k = self.train_cfg['selectable_k']  # 注意这里的k
+        clss_weight = self.train_cfg['clss_weight']
+        regg_weight = self.train_cfg['regg_weight']
+
+
         device = gt_labels_3d.device
         gt_bboxes_3d = torch.cat(
             (gt_bboxes_3d.gravity_center, gt_bboxes_3d.tensor[:, 3:]),         # 中心点
@@ -367,7 +371,7 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
             bbox_costs = [ preds_dicts_a_batch['reg'][idx], preds_dicts_a_batch['height'][idx], preds_dicts_a_batch['dim'][idx],\
                               preds_dicts_a_batch['rot'][idx], preds_dicts_a_batch['vel'][idx] ]
         cls_pred = torch.cat(cls_costs, dim=0).permute(1,2,0).reshape(-1,10)   # 10为类别数
-        cls_costs = cls_pred.detach()  
+        cls_costs = cls_pred.clone().detach()  
         reg_pred = torch.cat(bbox_costs, dim=0).permute(1,2,0)    # 10为
         bbox_costs = reg_pred.clone().detach() 
 
@@ -468,10 +472,13 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
 
                     
         # print(anno_boxes[0:5,0:10])
-
-        bbox_costs = torch.cdist(bbox_costs[:,:8], anno_boxes[:,:8], p=1)  #不计算速度
+        # 坐标恢复到原图尺寸 * self.train_cfg['out_size_factor']
+        bbox_costs[:,:3] = self.train_cfg['out_size_factor'] * bbox_costs[:,:3]
+        anno_boxes_clone = anno_boxes.clone()
+        anno_boxes_clone[:,:3] = self.train_cfg['out_size_factor'] * anno_boxes_clone[:,:3]
+        bbox_costs = self.bbox_cost(bbox_costs[:,:8], anno_boxes_clone[:,:8])  #不计算速度
         # bbox_costs = self.iou_bbox_cost(bbox_costs, anno_boxes_3d)
-        overlaps = - (cls_costs + bbox_costs)
+        overlaps = - (clss_weight*cls_costs + regg_weight*bbox_costs)
 
 
         assigned_gt_inds = overlaps.new_full((num_bboxes, ),
@@ -512,6 +519,7 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
         gt_bboxes = LiDARInstance3DBoxes(anno_boxes_3d, box_dim=anno_boxes_3d.shape[-1], origin=(0.5, 0.5, 0.5)).enlarge_bev()
         # print('中心点坐标', bboxes_cx[candidate_idxs[0]], bboxes_cy[candidate_idxs[0]])
         # print(gt_bboxes[0])
+        # print(cls_costs[candidate_idxs[0]][0], bbox_costs[candidate_idxs[0]][0])
 
 
         # calculate the left, top, right, bottom distance between positive
@@ -529,7 +537,7 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
         INF = 9999
         overlaps_inf = torch.full_like(overlaps,
                                        -INF).t().contiguous().view(-1)
-        index = candidate_idxs.view(-1)[is_in_gts.view(-1)]
+        index = candidate_idxs.view(-1)[is_in_gts.view(-1)]   # 限制位置
         # index = candidate_idxs.view(-1)
         overlaps_inf[index] = overlaps.t().contiguous().view(-1)[index]
         overlaps_inf = overlaps_inf.view(num_objs, -1).t()
@@ -545,7 +553,8 @@ class CenterHead_cost_assign_1task_focalcls_l1reg(BaseModule):
             num_pos = pos_inds.numel()
             assigned_labels[pos_inds] = task_classes[0][             # task_classes[0]  gt_labels_3d
                 assigned_gt_inds[pos_inds] - 1]
-
+        else:
+            num_pos = 0
         labels = gt_labels_3d.new_full((num_bboxes, ),
                                   10,
                                   dtype=torch.long)

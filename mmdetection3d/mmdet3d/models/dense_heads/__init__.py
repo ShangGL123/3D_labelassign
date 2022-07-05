@@ -20,6 +20,7 @@ from .centerpoint_head_cost_assign_1task import CenterHead_cost_assign_1task
 from .centerpoint_head_cost_assign_1task_3detr import CenterHead_cost_assign_1task_3detr
 from .centerpoint_head_cost_assign_1task_gfl import CenterHead_cost_assign_1task_gfl
 from .centerpoint_head_cost_assign_1task_focalcls_l1reg import CenterHead_cost_assign_1task_focalcls_l1reg
+from .centerpoint_head_cost_assign_1task_test import CenterHead_cost_assign_1task_test
 
 __all__ = [
     'Anchor3DHead', 'FreeAnchor3DHead', 'PartA2RPNHead', 'VoteHead',
@@ -28,5 +29,6 @@ __all__ = [
     'GroupFree3DHead', 'PointRPNHead', 'SMOKEMono3DHead', 'PGDHead',
     'MonoFlexHead','CenterHead_cost_assign', 'SeparateHead', 
     'CenterHead_cost_assign_1task', 'CenterHead_cost_assign_1task_3detr',
-    'CenterHead_cost_assign_1task_gfl', 'CenterHead_cost_assign_1task_focalcls_l1reg'
+    'CenterHead_cost_assign_1task_gfl', 'CenterHead_cost_assign_1task_focalcls_l1reg',
+    'CenterHead_cost_assign_1task_test'
 ]

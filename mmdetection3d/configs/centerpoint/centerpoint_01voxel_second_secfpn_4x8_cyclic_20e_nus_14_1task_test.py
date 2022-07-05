@@ -17,7 +17,7 @@ model = dict(
     pts_voxel_layer=dict(point_cloud_range=point_cloud_range),
 
     pts_bbox_head=dict(
-        type='CenterHead_cost_assign_1task_focalcls_l1reg',
+        type='CenterHead_cost_assign_1task_test',
         in_channels=sum([256, 256]),
         tasks=[
             dict(num_class=10, class_names=class_names),
@@ -48,8 +48,8 @@ model = dict(
     # model training and testing settings
     train_cfg=dict(
         pts=dict(
-            selectable_k=3,
-            clss_weight = 1,
+            selectable_k=9,
+            clss_weight = 0,
             regg_weight = 1,
             grid_size=[1024, 1024, 40],
             voxel_size=voxel_size,

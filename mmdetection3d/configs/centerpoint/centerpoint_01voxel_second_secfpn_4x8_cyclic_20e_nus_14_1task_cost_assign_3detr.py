@@ -42,7 +42,7 @@ model = dict(
             use_sigmoid=True,
             gamma=2.0,
             alpha=0.25,
-            loss_weight=1.0),
+            loss_weight=2.0),
         loss_bbox=dict(type='L1Loss', reduction='mean', loss_weight=0.25),
         norm_bbox=True),
     # model training and testing settings
